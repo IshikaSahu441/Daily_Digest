@@ -18,6 +18,6 @@ jobs:
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-          MUSE_API_KEY: ${{ secrets.MUSE_API_KEY }}
+          S2_API_KEY: ${{ secrets.S2_API_KEY }}
           ADZUNA_APP_ID: ${{ secrets.ADZUNA_APP_ID }}
           ADZUNA_APP_KEY: ${{ secrets.ADZUNA_APP_KEY }}

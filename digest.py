@@ -1,11 +1,11 @@
 import os
 import re
+import time
 import smtplib
 import datetime as dt
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import requests
-import feedparser
 
 HN_KEYWORDS = ["ai agents", "rust", "self-hosted", "compiler"]
 HN_MIN_POINTS = 30
@@ -20,15 +20,16 @@ GREENHOUSE_BOARDS = ["stripe", "airbnb"]
 LEVER_SITES = ["netflix"]
 ASHBY_BOARDS = ["ramp"]
 
-MUSE_LEVEL = "Entry Level"
-MUSE_CATEGORIES = ["Software Engineering", "Data Science", "Data and Analytics"]
+LOCATION_KEEP = ["bengaluru", "bangalore"]
+ALLOW_REMOTE = True
 
 ADZUNA_COUNTRY = "us"
 ADZUNA_QUERIES = ["junior software engineer", "entry level data", "graduate developer"]
 ADZUNA_MAX_DAYS = 1
 
-ARXIV_CATEGORIES = ["cs.AI", "cs.LG", "cs.CL"]
-ARXIV_PER_CATEGORY = 4
+PAPER_QUERIES = ["large language models", "AI agents", "reinforcement learning"]
+PAPER_FIELDS = "title,url,year,citationCount,authors"
+PAPER_PER_QUERY = 4
 
 SENIOR_MARKERS = ["senior", "sr.", "sr ", "staff", "principal", "lead", "manager",
                   "director", "head of", "vp ", "vice president", " ii", " iii", " iv"]
@@ -43,9 +44,9 @@ SMTP_USER = os.environ["SMTP_USER"]
 SMTP_PASS = os.environ["SMTP_PASS"]
 GROQ_KEY = os.environ.get("GROQ_API_KEY")
 GROQ_MODEL = "llama-3.3-70b-versatile"
-MUSE_KEY = os.environ.get("MUSE_API_KEY")
 ADZUNA_ID = os.environ.get("ADZUNA_APP_ID")
 ADZUNA_KEY = os.environ.get("ADZUNA_APP_KEY")
+S2_KEY = os.environ.get("S2_API_KEY")
 
 
 def cutoff_ts():
@@ -64,6 +65,13 @@ def seniority_rank(title):
 def job_matches(title):
     t = title.lower()
     return any(re.search(rf"\b{re.escape(k)}\b", t) for k in JOB_KEYWORDS)
+
+
+def location_ok(loc):
+    t = (loc or "").lower()
+    if ALLOW_REMOTE and "remote" in t:
+        return True
+    return any(c in t for c in LOCATION_KEEP)
 
 
 def fetch_hackernews():
@@ -87,7 +95,6 @@ def fetch_hackernews():
                 "url": h.get("url") or f"https://news.ycombinator.com/item?id={oid}",
                 "points": h.get("points", 0),
                 "comments": f"https://news.ycombinator.com/item?id={oid}",
-                "matched": kw,
             })
     seen, unique = set(), []
     for it in sorted(items, key=lambda x: x["points"], reverse=True):
@@ -133,26 +140,6 @@ def fetch_ashby(board):
     } for j in r.json().get("jobs", []) if job_matches(j["title"])]
 
 
-def fetch_themuse():
-    headers = {"X-Muse-Api-Key": MUSE_KEY} if MUSE_KEY else {}
-    params = [("level", MUSE_LEVEL), ("page", "0")]
-    for c in MUSE_CATEGORIES:
-        params.append(("category", c))
-    r = requests.get("https://www.themuse.com/api/public/v2/jobs",
-                     params=params, headers=headers, timeout=20)
-    r.raise_for_status()
-    out = []
-    for j in r.json().get("results", []):
-        out.append({
-            "company": (j.get("company") or {}).get("name", ""),
-            "title": j.get("name", ""),
-            "location": ", ".join(l["name"] for l in j.get("locations", [])) or "Flexible",
-            "url": (j.get("refs") or {}).get("landing_page", ""),
-            "source": "themuse",
-        })
-    return out
-
-
 def fetch_adzuna():
     if not (ADZUNA_ID and ADZUNA_KEY):
         return []
@@ -188,7 +175,7 @@ def fetch_jobs():
         [(t, fetch_greenhouse) for t in GREENHOUSE_BOARDS]
         + [(s, fetch_lever) for s in LEVER_SITES]
         + [(b, fetch_ashby) for b in ASHBY_BOARDS]
-        + [(None, fetch_themuse), (None, fetch_adzuna)]
+        + [(None, fetch_adzuna)]
     )
     for arg, fn in sources:
         try:
@@ -197,7 +184,7 @@ def fetch_jobs():
             print(f"{fn.__name__} {arg or ''} failed: {e}")
     seen, unique = set(), []
     for j in jobs:
-        if j["url"] and j["url"] not in seen:
+        if j["url"] and j["url"] not in seen and location_ok(j.get("location", "")):
             seen.add(j["url"])
             j["level"] = seniority_rank(j["title"])
             unique.append(j)
@@ -205,22 +192,42 @@ def fetch_jobs():
     return unique[:JOB_LIMIT]
 
 
-def fetch_arxiv():
+def fetch_papers():
+    year = dt.date.today().year
+    base = {"year": f"{year-1}-{year}", "sort": "citationCount:desc", "fields": PAPER_FIELDS}
+    headers = {"x-api-key": S2_KEY} if S2_KEY else {}
     papers, seen = [], set()
-    for cat in ARXIV_CATEGORIES:
-        url = (f"http://export.arxiv.org/api/query?search_query=cat:{cat}"
-               f"&sortBy=submittedDate&sortOrder=descending&max_results={ARXIV_PER_CATEGORY}")
-        feed = feedparser.parse(url)
-        for e in feed.entries:
-            if e.link in seen:
+    for q in PAPER_QUERIES:
+        data = None
+        for _ in range(2):
+            try:
+                r = requests.get(
+                    "https://api.semanticscholar.org/graph/v1/paper/search/bulk",
+                    params={**base, "query": q}, headers=headers, timeout=30,
+                )
+                if r.status_code == 429:
+                    time.sleep(3)
+                    continue
+                r.raise_for_status()
+                data = r.json().get("data") or []
+                break
+            except Exception as e:
+                print(f"papers '{q}' failed: {e}")
+                break
+        for p in (data or [])[:PAPER_PER_QUERY]:
+            url = p.get("url")
+            if not url or url in seen:
                 continue
-            seen.add(e.link)
+            seen.add(url)
             papers.append({
-                "title": " ".join(e.title.split()),
-                "url": e.link,
-                "authors": ", ".join(a.name for a in e.get("authors", [])[:3]),
-                "category": cat,
+                "title": " ".join((p.get("title") or "").split()),
+                "url": url,
+                "year": p.get("year") or "",
+                "cites": p.get("citationCount") or 0,
+                "authors": ", ".join(a.get("name", "") for a in (p.get("authors") or [])[:3]),
             })
+        time.sleep(1.2)
+    papers.sort(key=lambda x: x["cites"], reverse=True)
     return papers
 
 
@@ -267,15 +274,15 @@ def build_html(hn, papers, jobs, summary):
     else:
         p.append('<p style="color:#666">Nothing above threshold.</p>')
 
-    p.append('<h2 style="font-size:16px;border-bottom:1px solid #ddd;padding-bottom:4px">Research papers</h2>')
+    p.append('<h2 style="font-size:16px;border-bottom:1px solid #ddd;padding-bottom:4px">Research papers (most cited, past year)</h2>')
     if papers:
         for pp in papers:
             p.append(
                 f'<p style="margin:8px 0"><a href="{pp["url"]}" style="color:#0a58ca;text-decoration:none;font-weight:bold">{pp["title"]}</a>'
-                f'<br><span style="color:#666;font-size:12px">{pp["category"]} &middot; {pp["authors"]}</span></p>'
+                f'<br><span style="color:#666;font-size:12px">{pp["cites"]} citations &middot; {pp["year"]} &middot; {pp["authors"]}</span></p>'
             )
     else:
-        p.append('<p style="color:#666">No new papers.</p>')
+        p.append('<p style="color:#666">No papers today.</p>')
 
     p.append('<h2 style="font-size:16px;border-bottom:1px solid #ddd;padding-bottom:4px">Jobs (entry-level first)</h2>')
     if jobs:
@@ -308,7 +315,7 @@ def send_email(html):
 
 def main():
     hn = fetch_hackernews()
-    papers = fetch_arxiv()
+    papers = fetch_papers()
     jobs = fetch_jobs()
     summary = summarize(hn)
     send_email(build_html(hn, papers, jobs, summary))
