@@ -20,7 +20,8 @@ SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
 SMTP_USER = os.environ["SMTP_USER"]
 SMTP_PASS = os.environ["SMTP_PASS"]
-ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY")
+GROQ_KEY = os.environ.get("GROQ_API_KEY")
+GROQ_MODEL = "llama-3.3-70b-versatile"
 
 
 def cutoff_ts():
@@ -110,19 +111,18 @@ def fetch_jobs():
     return jobs
 
 
-def summarize_with_claude(hn):
-    if not ANTHROPIC_KEY or not hn:
+def summarize(hn):
+    if not GROQ_KEY or not hn:
         return None
     listing = "\n".join(f"- {it['title']} ({it['points']} pts)" for it in hn)
     r = requests.post(
-        "https://api.anthropic.com/v1/messages",
+        "https://api.groq.com/openai/v1/chat/completions",
         headers={
-            "x-api-key": ANTHROPIC_KEY,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
+            "Authorization": f"Bearer {GROQ_KEY}",
+            "Content-Type": "application/json",
         },
         json={
-            "model": "claude-haiku-4-5-20251001",
+            "model": GROQ_MODEL,
             "max_tokens": 400,
             "messages": [{
                 "role": "user",
@@ -133,7 +133,7 @@ def summarize_with_claude(hn):
         timeout=30,
     )
     r.raise_for_status()
-    return "".join(b["text"] for b in r.json()["content"] if b["type"] == "text").strip()
+    return r.json()["choices"][0]["message"]["content"].strip()
 
 
 def build_html(hn, jobs, summary):
@@ -183,7 +183,7 @@ def send_email(html):
 def main():
     hn = fetch_hackernews()
     jobs = fetch_jobs()
-    summary = summarize_with_claude(hn)
+    summary = summarize(hn)
     send_email(build_html(hn, jobs, summary))
     print(f"sent {len(hn)} HN items and {len(jobs)} jobs")
 
