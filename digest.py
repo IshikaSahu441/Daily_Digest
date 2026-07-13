@@ -1,19 +1,40 @@
 import os
-import json
+import re
 import smtplib
 import datetime as dt
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import requests
+import feedparser
 
 HN_KEYWORDS = ["ai agents", "rust", "self-hosted", "compiler"]
-JOB_KEYWORDS = ["backend", "python", "founding engineer", "senior software", "AI", "machine learning", "ML", "data engineer", "data scientist"]
 HN_MIN_POINTS = 30
 MAX_AGE_HOURS = 24
+
+JOB_KEYWORDS = ["backend", "python", "founding engineer", "software engineer",
+                "ai", "machine learning", "ml", "data engineer", "data scientist",
+                "junior", "new grad", "associate"]
+JOB_LIMIT = 30
 
 GREENHOUSE_BOARDS = ["stripe", "airbnb"]
 LEVER_SITES = ["netflix"]
 ASHBY_BOARDS = ["ramp"]
+
+MUSE_LEVEL = "Entry Level"
+MUSE_CATEGORIES = ["Software Engineering", "Data Science", "Data and Analytics"]
+
+ADZUNA_COUNTRY = "us"
+ADZUNA_QUERIES = ["junior software engineer", "entry level data", "graduate developer"]
+ADZUNA_MAX_DAYS = 1
+
+ARXIV_CATEGORIES = ["cs.AI", "cs.LG", "cs.CL"]
+ARXIV_PER_CATEGORY = 4
+
+SENIOR_MARKERS = ["senior", "sr.", "sr ", "staff", "principal", "lead", "manager",
+                  "director", "head of", "vp ", "vice president", " ii", " iii", " iv"]
+ENTRY_MARKERS = ["junior", "jr.", "jr ", "entry", "new grad", "new graduate",
+                 "graduate", "associate", "intern", "apprentice", "early career"]
+LEVEL_LABEL = {0: "entry", 1: "mid", 2: "senior"}
 
 RECIPIENT = os.environ["DIGEST_TO"]
 SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.gmail.com")
@@ -22,10 +43,27 @@ SMTP_USER = os.environ["SMTP_USER"]
 SMTP_PASS = os.environ["SMTP_PASS"]
 GROQ_KEY = os.environ.get("GROQ_API_KEY")
 GROQ_MODEL = "llama-3.3-70b-versatile"
+MUSE_KEY = os.environ.get("MUSE_API_KEY")
+ADZUNA_ID = os.environ.get("ADZUNA_APP_ID")
+ADZUNA_KEY = os.environ.get("ADZUNA_APP_KEY")
 
 
 def cutoff_ts():
     return int((dt.datetime.utcnow() - dt.timedelta(hours=MAX_AGE_HOURS)).timestamp())
+
+
+def seniority_rank(title):
+    t = f" {title.lower()} "
+    if any(m in t for m in ENTRY_MARKERS):
+        return 0
+    if any(m in t for m in SENIOR_MARKERS):
+        return 2
+    return 1
+
+
+def job_matches(title):
+    t = title.lower()
+    return any(re.search(rf"\b{re.escape(k)}\b", t) for k in JOB_KEYWORDS)
 
 
 def fetch_hackernews():
@@ -59,11 +97,6 @@ def fetch_hackernews():
     return unique
 
 
-def job_matches(title):
-    t = title.lower()
-    return any(k in t for k in JOB_KEYWORDS)
-
-
 def fetch_greenhouse(token):
     r = requests.get(f"https://boards-api.greenhouse.io/v1/boards/{token}/jobs", timeout=20)
     r.raise_for_status()
@@ -72,6 +105,7 @@ def fetch_greenhouse(token):
         "title": j["title"],
         "location": (j.get("location") or {}).get("name", ""),
         "url": j["absolute_url"],
+        "source": "greenhouse",
     } for j in r.json().get("jobs", []) if job_matches(j["title"])]
 
 
@@ -83,6 +117,7 @@ def fetch_lever(site):
         "title": j["text"],
         "location": j.get("categories", {}).get("location", ""),
         "url": j["hostedUrl"],
+        "source": "lever",
     } for j in r.json() if job_matches(j["text"])]
 
 
@@ -94,21 +129,99 @@ def fetch_ashby(board):
         "title": j["title"],
         "location": j.get("location", ""),
         "url": j["jobUrl"],
+        "source": "ashby",
     } for j in r.json().get("jobs", []) if job_matches(j["title"])]
+
+
+def fetch_themuse():
+    headers = {"X-Muse-Api-Key": MUSE_KEY} if MUSE_KEY else {}
+    params = [("level", MUSE_LEVEL), ("page", "0")]
+    for c in MUSE_CATEGORIES:
+        params.append(("category", c))
+    r = requests.get("https://www.themuse.com/api/public/v2/jobs",
+                     params=params, headers=headers, timeout=20)
+    r.raise_for_status()
+    out = []
+    for j in r.json().get("results", []):
+        out.append({
+            "company": (j.get("company") or {}).get("name", ""),
+            "title": j.get("name", ""),
+            "location": ", ".join(l["name"] for l in j.get("locations", [])) or "Flexible",
+            "url": (j.get("refs") or {}).get("landing_page", ""),
+            "source": "themuse",
+        })
+    return out
+
+
+def fetch_adzuna():
+    if not (ADZUNA_ID and ADZUNA_KEY):
+        return []
+    out = []
+    for q in ADZUNA_QUERIES:
+        r = requests.get(
+            f"https://api.adzuna.com/v1/api/jobs/{ADZUNA_COUNTRY}/search/1",
+            params={
+                "app_id": ADZUNA_ID,
+                "app_key": ADZUNA_KEY,
+                "what": q,
+                "max_days_old": ADZUNA_MAX_DAYS,
+                "results_per_page": 20,
+                "sort_by": "date",
+            },
+            timeout=20,
+        )
+        r.raise_for_status()
+        for j in r.json().get("results", []):
+            out.append({
+                "company": (j.get("company") or {}).get("display_name", ""),
+                "title": j.get("title", ""),
+                "location": (j.get("location") or {}).get("display_name", ""),
+                "url": j.get("redirect_url", ""),
+                "source": "adzuna",
+            })
+    return out
 
 
 def fetch_jobs():
     jobs = []
-    for token, fn in (
+    sources = (
         [(t, fetch_greenhouse) for t in GREENHOUSE_BOARDS]
         + [(s, fetch_lever) for s in LEVER_SITES]
         + [(b, fetch_ashby) for b in ASHBY_BOARDS]
-    ):
+        + [(None, fetch_themuse), (None, fetch_adzuna)]
+    )
+    for arg, fn in sources:
         try:
-            jobs += fn(token)
+            jobs += fn(arg) if arg is not None else fn()
         except Exception as e:
-            print(f"{fn.__name__} {token} failed: {e}")
-    return jobs
+            print(f"{fn.__name__} {arg or ''} failed: {e}")
+    seen, unique = set(), []
+    for j in jobs:
+        if j["url"] and j["url"] not in seen:
+            seen.add(j["url"])
+            j["level"] = seniority_rank(j["title"])
+            unique.append(j)
+    unique.sort(key=lambda j: j["level"])
+    return unique[:JOB_LIMIT]
+
+
+def fetch_arxiv():
+    papers, seen = [], set()
+    for cat in ARXIV_CATEGORIES:
+        url = (f"http://export.arxiv.org/api/query?search_query=cat:{cat}"
+               f"&sortBy=submittedDate&sortOrder=descending&max_results={ARXIV_PER_CATEGORY}")
+        feed = feedparser.parse(url)
+        for e in feed.entries:
+            if e.link in seen:
+                continue
+            seen.add(e.link)
+            papers.append({
+                "title": " ".join(e.title.split()),
+                "url": e.link,
+                "authors": ", ".join(a.name for a in e.get("authors", [])[:3]),
+                "category": cat,
+            })
+    return papers
 
 
 def summarize(hn):
@@ -136,9 +249,9 @@ def summarize(hn):
     return r.json()["choices"][0]["message"]["content"].strip()
 
 
-def build_html(hn, jobs, summary):
+def build_html(hn, papers, jobs, summary):
     today = dt.date.today().strftime("%A, %d %B %Y")
-    p = [f'<div style="font-family:Arial,sans-serif;max-width:640px;margin:auto;color:#1a1a1a">']
+    p = ['<div style="font-family:Arial,sans-serif;max-width:640px;margin:auto;color:#1a1a1a">']
     p.append(f'<h1 style="font-size:20px">Morning digest &mdash; {today}</h1>')
     if summary:
         p.append(f'<p style="background:#f4f4f4;padding:10px;border-radius:6px;font-size:14px">{summary}</p>')
@@ -149,17 +262,30 @@ def build_html(hn, jobs, summary):
             p.append(
                 f'<p style="margin:8px 0"><a href="{it["url"]}" style="color:#0a58ca;text-decoration:none;font-weight:bold">{it["title"]}</a>'
                 f'<br><span style="color:#666;font-size:12px">{it["points"]} points &middot; '
-                f'<a href="{it["comments"]}" style="color:#666">comments</a> &middot; matched &ldquo;{it["matched"]}&rdquo;</span></p>'
+                f'<a href="{it["comments"]}" style="color:#666">comments</a></span></p>'
             )
     else:
         p.append('<p style="color:#666">Nothing above threshold.</p>')
 
-    p.append('<h2 style="font-size:16px;border-bottom:1px solid #ddd;padding-bottom:4px">Jobs</h2>')
+    p.append('<h2 style="font-size:16px;border-bottom:1px solid #ddd;padding-bottom:4px">Research papers</h2>')
+    if papers:
+        for pp in papers:
+            p.append(
+                f'<p style="margin:8px 0"><a href="{pp["url"]}" style="color:#0a58ca;text-decoration:none;font-weight:bold">{pp["title"]}</a>'
+                f'<br><span style="color:#666;font-size:12px">{pp["category"]} &middot; {pp["authors"]}</span></p>'
+            )
+    else:
+        p.append('<p style="color:#666">No new papers.</p>')
+
+    p.append('<h2 style="font-size:16px;border-bottom:1px solid #ddd;padding-bottom:4px">Jobs (entry-level first)</h2>')
     if jobs:
         for j in jobs:
+            level = LEVEL_LABEL[j["level"]]
+            tag_color = {"entry": "#0a7c2f", "mid": "#666", "senior": "#999"}[level]
             p.append(
                 f'<p style="margin:8px 0"><a href="{j["url"]}" style="color:#0a58ca;text-decoration:none;font-weight:bold">{j["title"]}</a>'
-                f'<br><span style="color:#666;font-size:12px">{j["company"]} &middot; {j["location"]}</span></p>'
+                f'<br><span style="color:#666;font-size:12px">{j["company"]} &middot; {j["location"]} &middot; {j["source"]} &middot; '
+                f'<span style="color:{tag_color};font-weight:bold">{level}</span></span></p>'
             )
     else:
         p.append('<p style="color:#666">No matching roles today.</p>')
@@ -182,10 +308,11 @@ def send_email(html):
 
 def main():
     hn = fetch_hackernews()
+    papers = fetch_arxiv()
     jobs = fetch_jobs()
     summary = summarize(hn)
-    send_email(build_html(hn, jobs, summary))
-    print(f"sent {len(hn)} HN items and {len(jobs)} jobs")
+    send_email(build_html(hn, papers, jobs, summary))
+    print(f"sent {len(hn)} HN items, {len(papers)} papers, {len(jobs)} jobs")
 
 
 if __name__ == "__main__":
