@@ -14,21 +14,33 @@ MAX_AGE_HOURS = 24
 JOB_KEYWORDS = ["backend", "python", "founding engineer", "software engineer",
                 "ai", "machine learning", "ml", "data engineer", "data scientist",
                 "junior", "new grad", "associate"]
-JOB_LIMIT = 30
+JOB_LIMIT = 60
 
-GREENHOUSE_BOARDS = ["stripe", "airbnb"]
-LEVER_SITES = ["netflix"]
-ASHBY_BOARDS = ["ramp"]
+GREENHOUSE_BOARDS = ["stripe", "airbnb", "databricks", "dropbox", "cloudflare",
+                     "doordash", "gitlab", "twilio", "robinhood", "coinbase",
+                     "flipkart", "razorpay", "postman", "sprinklr", "freshworks"]
+LEVER_SITES = ["netflix", "swiggy", "meesho", "browserstack", "zeta"]
+ASHBY_BOARDS = ["ramp", "notion", "linear", "vanta", "deel", "hasura"]
 
 LOCATION_KEEP = ["bengaluru", "bangalore"]
 ALLOW_REMOTE = True
 
-ADZUNA_COUNTRY = "us"
-ADZUNA_QUERIES = ["junior software engineer", "entry level data", "graduate developer"]
+ADZUNA_COUNTRY = "in"
+ADZUNA_WHERE = "Bengaluru"
+ADZUNA_QUERIES = ["junior software engineer", "entry level data", "graduate developer",
+                  "software engineer fresher", "machine learning engineer", "python developer"]
 ADZUNA_MAX_DAYS = 1
+ADZUNA_PAGES = 2
 
-PAPER_QUERIES = ["large language models", "AI agents", "reinforcement learning"]
-PAPER_FIELDS = "title,url,year,citationCount,authors"
+PAPER_TOPIC_POOL = ["large language models", "AI agents", "reinforcement learning",
+                    "retrieval augmented generation", "multimodal models",
+                    "model quantization efficiency", "LLM evaluation benchmarks",
+                    "code generation models", "diffusion models", "AI alignment safety",
+                    "graph neural networks", "speech recognition", "vector search",
+                    "federated learning", "time series forecasting"]
+PAPER_TOPICS_PER_DAY = 3
+PAPER_WINDOW_DAYS = 120
+PAPER_FIELDS = "title,url,year,publicationDate,citationCount,authors"
 PAPER_PER_QUERY = 4
 
 SENIOR_MARKERS = ["senior", "sr.", "sr ", "staff", "principal", "lead", "manager",
@@ -145,27 +157,37 @@ def fetch_adzuna():
         return []
     out = []
     for q in ADZUNA_QUERIES:
-        r = requests.get(
-            f"https://api.adzuna.com/v1/api/jobs/{ADZUNA_COUNTRY}/search/1",
-            params={
-                "app_id": ADZUNA_ID,
-                "app_key": ADZUNA_KEY,
-                "what": q,
-                "max_days_old": ADZUNA_MAX_DAYS,
-                "results_per_page": 20,
-                "sort_by": "date",
-            },
-            timeout=20,
-        )
-        r.raise_for_status()
-        for j in r.json().get("results", []):
-            out.append({
-                "company": (j.get("company") or {}).get("display_name", ""),
-                "title": j.get("title", ""),
-                "location": (j.get("location") or {}).get("display_name", ""),
-                "url": j.get("redirect_url", ""),
-                "source": "adzuna",
-            })
+        for page in range(1, ADZUNA_PAGES + 1):
+            try:
+                r = requests.get(
+                    f"https://api.adzuna.com/v1/api/jobs/{ADZUNA_COUNTRY}/search/{page}",
+                    params={
+                        "app_id": ADZUNA_ID,
+                        "app_key": ADZUNA_KEY,
+                        "what": q,
+                        "where": ADZUNA_WHERE,
+                        "max_days_old": ADZUNA_MAX_DAYS,
+                        "results_per_page": 20,
+                        "sort_by": "date",
+                    },
+                    timeout=20,
+                )
+                r.raise_for_status()
+                results = r.json().get("results", [])
+            except Exception as e:
+                print(f"adzuna '{q}' page {page} failed: {e}")
+                break
+            for j in results:
+                out.append({
+                    "company": (j.get("company") or {}).get("display_name", ""),
+                    "title": j.get("title", ""),
+                    "location": (j.get("location") or {}).get("display_name", ""),
+                    "url": j.get("redirect_url", ""),
+                    "source": "adzuna",
+                })
+            if len(results) < 20:
+                break
+            time.sleep(0.5)
     return out
 
 
@@ -192,12 +214,23 @@ def fetch_jobs():
     return unique[:JOB_LIMIT]
 
 
+def todays_topics():
+    n = len(PAPER_TOPIC_POOL)
+    start = (dt.date.today().toordinal() * PAPER_TOPICS_PER_DAY) % n
+    return [PAPER_TOPIC_POOL[(start + i) % n] for i in range(PAPER_TOPICS_PER_DAY)]
+
+
 def fetch_papers():
-    year = dt.date.today().year
-    base = {"year": f"{year-1}-{year}", "sort": "citationCount:desc", "fields": PAPER_FIELDS}
+    today = dt.date.today()
+    since = today - dt.timedelta(days=PAPER_WINDOW_DAYS)
+    base = {
+        "publicationDateOrYear": f"{since.isoformat()}:{today.isoformat()}",
+        "sort": "citationCount:desc",
+        "fields": PAPER_FIELDS,
+    }
     headers = {"x-api-key": S2_KEY} if S2_KEY else {}
     papers, seen = [], set()
-    for q in PAPER_QUERIES:
+    for q in todays_topics():
         data = None
         for _ in range(2):
             try:
@@ -222,8 +255,9 @@ def fetch_papers():
             papers.append({
                 "title": " ".join((p.get("title") or "").split()),
                 "url": url,
-                "year": p.get("year") or "",
+                "date": p.get("publicationDate") or str(p.get("year") or ""),
                 "cites": p.get("citationCount") or 0,
+                "topic": q,
                 "authors": ", ".join(a.get("name", "") for a in (p.get("authors") or [])[:3]),
             })
         time.sleep(1.2)
@@ -274,12 +308,12 @@ def build_html(hn, papers, jobs, summary):
     else:
         p.append('<p style="color:#666">Nothing above threshold.</p>')
 
-    p.append('<h2 style="font-size:16px;border-bottom:1px solid #ddd;padding-bottom:4px">Research papers (most cited, past year)</h2>')
+    p.append('<h2 style="font-size:16px;border-bottom:1px solid #ddd;padding-bottom:4px">Research papers (recent, most cited)</h2>')
     if papers:
         for pp in papers:
             p.append(
                 f'<p style="margin:8px 0"><a href="{pp["url"]}" style="color:#0a58ca;text-decoration:none;font-weight:bold">{pp["title"]}</a>'
-                f'<br><span style="color:#666;font-size:12px">{pp["cites"]} citations &middot; {pp["year"]} &middot; {pp["authors"]}</span></p>'
+                f'<br><span style="color:#666;font-size:12px">{pp["cites"]} citations &middot; {pp["date"]} &middot; {pp["topic"]} &middot; {pp["authors"]}</span></p>'
             )
     else:
         p.append('<p style="color:#666">No papers today.</p>')
