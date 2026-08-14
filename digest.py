@@ -14,23 +14,24 @@ MAX_AGE_HOURS = 24
 JOB_KEYWORDS = ["backend", "python", "founding engineer", "software engineer",
                 "ai", "machine learning", "ml", "data engineer", "data scientist",
                 "junior", "new grad", "associate"]
-JOB_LIMIT = 60
+JOB_LIMIT = 150
 
 GREENHOUSE_BOARDS = ["stripe", "airbnb", "databricks", "dropbox", "cloudflare",
-                     "doordash", "gitlab", "twilio", "robinhood", "coinbase",
-                     "flipkart", "razorpay", "postman", "sprinklr", "freshworks"]
-LEVER_SITES = ["netflix", "swiggy", "meesho", "browserstack", "zeta"]
-ASHBY_BOARDS = ["ramp", "notion", "linear", "vanta", "deel", "hasura"]
+                     "gitlab", "twilio", "robinhood", "coinbase", "postman"]
+LEVER_SITES = ["meesho", "zeta"]
+ASHBY_BOARDS = ["ramp", "notion", "linear", "vanta", "deel"]
 
-LOCATION_KEEP = ["bengaluru", "bangalore"]
-ALLOW_REMOTE = True
+FILTER_LOCATION = True
+LOCATION_KEEP = ["bengaluru", "bangalore", "mumbai", "hyderabad", "pune",
+                 "delhi", "gurugram", "gurgaon", "noida", "chennai",
+                 "kolkata", "ahmedabad", "india", "anywhere", "worldwide", "remote"]
 
-ADZUNA_COUNTRY = "in"
-ADZUNA_WHERE = "Bengaluru"
+ADZUNA_COUNTRIES = ["in"]
+ADZUNA_WHERE = ""
 ADZUNA_QUERIES = ["junior software engineer", "entry level data", "graduate developer",
                   "software engineer fresher", "machine learning engineer", "python developer"]
 ADZUNA_MAX_DAYS = 1
-ADZUNA_PAGES = 2
+ADZUNA_PAGES = 3
 
 PAPER_TOPIC_POOL = ["large language models", "AI agents", "reinforcement learning",
                     "retrieval augmented generation", "multimodal models",
@@ -62,7 +63,7 @@ S2_KEY = os.environ.get("S2_API_KEY")
 
 
 def cutoff_ts():
-    return int((dt.datetime.utcnow() - dt.timedelta(hours=MAX_AGE_HOURS)).timestamp())
+    return int((dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=MAX_AGE_HOURS)).timestamp())
 
 
 def seniority_rank(title):
@@ -80,10 +81,10 @@ def job_matches(title):
 
 
 def location_ok(loc):
-    t = (loc or "").lower()
-    if ALLOW_REMOTE and "remote" in t:
+    if not FILTER_LOCATION:
         return True
-    return any(c in t for c in LOCATION_KEEP)
+    t = (loc or "").lower()
+    return any(re.search(rf"\b{re.escape(c)}\b", t) for c in LOCATION_KEEP)
 
 
 def fetch_hackernews():
@@ -156,38 +157,40 @@ def fetch_adzuna():
     if not (ADZUNA_ID and ADZUNA_KEY):
         return []
     out = []
-    for q in ADZUNA_QUERIES:
-        for page in range(1, ADZUNA_PAGES + 1):
-            try:
-                r = requests.get(
-                    f"https://api.adzuna.com/v1/api/jobs/{ADZUNA_COUNTRY}/search/{page}",
-                    params={
-                        "app_id": ADZUNA_ID,
-                        "app_key": ADZUNA_KEY,
-                        "what": q,
-                        "where": ADZUNA_WHERE,
-                        "max_days_old": ADZUNA_MAX_DAYS,
-                        "results_per_page": 20,
-                        "sort_by": "date",
-                    },
-                    timeout=20,
-                )
-                r.raise_for_status()
-                results = r.json().get("results", [])
-            except Exception as e:
-                print(f"adzuna '{q}' page {page} failed: {e}")
-                break
-            for j in results:
-                out.append({
-                    "company": (j.get("company") or {}).get("display_name", ""),
-                    "title": j.get("title", ""),
-                    "location": (j.get("location") or {}).get("display_name", ""),
-                    "url": j.get("redirect_url", ""),
-                    "source": "adzuna",
-                })
-            if len(results) < 20:
-                break
-            time.sleep(0.5)
+    for country in ADZUNA_COUNTRIES:
+        for q in ADZUNA_QUERIES:
+            for page in range(1, ADZUNA_PAGES + 1):
+                params = {
+                    "app_id": ADZUNA_ID,
+                    "app_key": ADZUNA_KEY,
+                    "what": q,
+                    "max_days_old": ADZUNA_MAX_DAYS,
+                    "results_per_page": 50,
+                    "sort_by": "date",
+                }
+                if ADZUNA_WHERE:
+                    params["where"] = ADZUNA_WHERE
+                try:
+                    r = requests.get(
+                        f"https://api.adzuna.com/v1/api/jobs/{country}/search/{page}",
+                        params=params, timeout=20,
+                    )
+                    r.raise_for_status()
+                    results = r.json().get("results", [])
+                except Exception as e:
+                    print(f"adzuna {country} '{q}' page {page} failed: {e}")
+                    break
+                for j in results:
+                    out.append({
+                        "company": (j.get("company") or {}).get("display_name", ""),
+                        "title": j.get("title", ""),
+                        "location": (j.get("location") or {}).get("display_name", ""),
+                        "url": j.get("redirect_url", ""),
+                        "source": "adzuna",
+                    })
+                if len(results) < 50:
+                    break
+                time.sleep(0.5)
     return out
 
 
@@ -347,11 +350,19 @@ def send_email(html):
         s.sendmail(SMTP_USER, [RECIPIENT], msg.as_string())
 
 
+def safe(fn, default):
+    try:
+        return fn()
+    except Exception as e:
+        print(f"{fn.__name__} failed: {e}")
+        return default
+
+
 def main():
-    hn = fetch_hackernews()
-    papers = fetch_papers()
-    jobs = fetch_jobs()
-    summary = summarize(hn)
+    hn = safe(fetch_hackernews, [])
+    papers = safe(fetch_papers, [])
+    jobs = safe(fetch_jobs, [])
+    summary = safe(lambda: summarize(hn), None)
     send_email(build_html(hn, papers, jobs, summary))
     print(f"sent {len(hn)} HN items, {len(papers)} papers, {len(jobs)} jobs")
 
