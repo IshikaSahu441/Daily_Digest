@@ -17,7 +17,7 @@ JOB_KEYWORDS = ["backend", "python", "founding engineer", "software engineer",
 JOB_LIMIT = 150
 
 GREENHOUSE_BOARDS = ["stripe", "airbnb", "databricks", "dropbox", "cloudflare",
-                     "gitlab", "twilio", "robinhood", "coinbase", "postman"]
+                     "gitlab", "twilio", "robinhood", "coinbase"]
 LEVER_SITES = ["meesho", "zeta"]
 ASHBY_BOARDS = ["ramp", "notion", "linear", "vanta", "deel"]
 
@@ -56,7 +56,7 @@ SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
 SMTP_USER = os.environ["SMTP_USER"]
 SMTP_PASS = os.environ["SMTP_PASS"]
 GROQ_KEY = os.environ.get("GROQ_API_KEY")
-GROQ_MODEL = "llama-3.3-70b-versatile"
+GROQ_MODEL = "llama3-70b-8192"
 ADZUNA_ID = os.environ.get("ADZUNA_APP_ID")
 ADZUNA_KEY = os.environ.get("ADZUNA_APP_KEY")
 S2_KEY = os.environ.get("S2_API_KEY")
